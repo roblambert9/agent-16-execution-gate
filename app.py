@@ -12,7 +12,7 @@ Signals evaluated per request:
   2. Fear & Greed  — composite market emotion index (Agent 4i)
   3. Macro         — risk-on / risk-off environment (Agent 4d)
   4. Whale         — accumulation / distribution pressure (Agent 4e)
-  5. Volatility    — local price volatility classification
+  5. Volatility    — local price volatility classification (CoinGecko)
 
 Verdict logic:
   GO      — 4+ signals align with proposed action (high confidence)
@@ -35,18 +35,18 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 app = Flask(__name__)
 
-# ── Agent URLs ────────────────────────────────────────────────────────────────
+# ── Agent URLs (confirmed live Railway URLs — audited 2026-04-03) ─────────────
 
 SENTIMENT_URL  = os.getenv("SENTIMENT_URL",  "https://crypto-sentiment-api-production.up.railway.app")
-FEAR_GREED_URL = os.getenv("FEAR_GREED_URL", "https://fear-greed-api-production.up.railway.app")
-MACRO_URL      = os.getenv("MACRO_URL",      "https://macro-signal-api-production.up.railway.app")
-WHALE_URL      = os.getenv("WHALE_URL",      "https://whale-monitor-api-production.up.railway.app")
+FEAR_GREED_URL = os.getenv("FEAR_GREED_URL", "https://web-production-0ce92.up.railway.app")   # Agent 4i
+MACRO_URL      = os.getenv("MACRO_URL",      "https://web-production-fcc3.up.railway.app")    # Agent 4d
+WHALE_URL      = os.getenv("WHALE_URL",      "https://web-production-4d1ba.up.railway.app")   # Agent 4e
 
 # ── Payment config ────────────────────────────────────────────────────────────
 
-CALL_COST_USD    = float(os.getenv("CALL_COST_USD", "0.010"))
+CALL_COST_USD     = float(os.getenv("CALL_COST_USD", "0.010"))
 FREE_CALLS_PER_IP = int(os.getenv("FREE_CALLS_PER_IP", "20"))
-PAYMENT_ENABLED  = os.getenv("PAYMENT_ENABLED", "false").lower() == "true"
+PAYMENT_ENABLED   = os.getenv("PAYMENT_ENABLED", "false").lower() == "true"
 
 # ── In-memory counters ────────────────────────────────────────────────────────
 
@@ -75,13 +75,13 @@ def fetch_sentiment(ticker: str, asset_type: str) -> dict:
                 "confidence": d.get("confidence", "low"),
                 "ok": True
             }
-    except Exception as e:
+    except Exception:
         pass
     return {"signal": "sentiment", "ok": False, "error": "unavailable"}
 
 
 def fetch_fear_greed(ticker: str) -> dict:
-    """Fetch composite fear & greed index."""
+    """Fetch composite fear & greed index from Agent 4i."""
     asset = ticker if ticker in SUPPORTED_CRYPTO else "BTC"
     try:
         r = requests.get(f"{FEAR_GREED_URL}/signal", params={"asset": asset}, timeout=6)
@@ -100,7 +100,7 @@ def fetch_fear_greed(ticker: str) -> dict:
 
 
 def fetch_macro() -> dict:
-    """Fetch macro risk-on / risk-off signal."""
+    """Fetch macro risk-on / risk-off signal from Agent 4d."""
     try:
         r = requests.get(f"{MACRO_URL}/snapshot", timeout=6)
         if r.status_code == 200:
@@ -118,7 +118,7 @@ def fetch_macro() -> dict:
 
 
 def fetch_whale(ticker: str) -> dict:
-    """Fetch whale accumulation / distribution signal."""
+    """Fetch whale accumulation / distribution signal from Agent 4e."""
     asset = ticker if ticker in ["BTC", "ETH"] else "BTC"
     try:
         r = requests.get(f"{WHALE_URL}/signal", params={"asset": asset}, timeout=6)
@@ -137,8 +137,7 @@ def fetch_whale(ticker: str) -> dict:
 
 def compute_local_volatility(ticker: str) -> dict:
     """
-    Compute a simple volatility classification from CoinGecko price data.
-    Uses 24h price change percentage as a proxy for near-term volatility.
+    Compute volatility classification from CoinGecko 24h price change.
     Falls back gracefully if CoinGecko is unavailable.
     """
     COIN_IDS = {
@@ -181,11 +180,8 @@ def compute_local_volatility(ticker: str) -> dict:
 # ── Verdict engine ────────────────────────────────────────────────────────────
 
 def score_signal_for_action(sig: dict, action: str) -> tuple[bool, str]:
-    """
-    Return (aligned: bool, reason: str) — does this signal support the proposed action?
-    """
+    """Return (aligned: bool, reason: str) — does this signal support the action?"""
     action = action.lower()
-
     name = sig.get("signal")
 
     if name == "sentiment":
@@ -198,7 +194,7 @@ def score_signal_for_action(sig: dict, action: str) -> tuple[bool, str]:
         elif action == "sell":
             aligned = score <= 45
             return aligned, f"sentiment={score}/100 ({'supports sell' if aligned else 'weak for sell'})"
-        else:  # hold
+        else:
             aligned = 40 <= score <= 60
             return aligned, f"sentiment={score}/100 ({'neutral — supports hold' if aligned else 'directional — reconsider hold'})"
 
@@ -260,10 +256,7 @@ def score_signal_for_action(sig: dict, action: str) -> tuple[bool, str]:
 
 
 def compute_verdict(signals: list[dict], action: str) -> dict:
-    """
-    Evaluate all signals against the proposed action.
-    Returns verdict, score, breakdown, and recommendation.
-    """
+    """Evaluate all signals, return verdict + breakdown."""
     results = []
     aligned_count = 0
     available_count = 0
@@ -278,7 +271,6 @@ def compute_verdict(signals: list[dict], action: str) -> dict:
                 aligned_count += 1
             results.append({"signal": sig.get("signal"), "aligned": aligned, "reason": reason})
 
-    # Score: aligned / available (ignore unavailable signals)
     score = round((aligned_count / available_count * 100) if available_count > 0 else 50)
 
     if available_count == 0:
@@ -286,15 +278,14 @@ def compute_verdict(signals: list[dict], action: str) -> dict:
         summary = "All signals unavailable — cannot evaluate. Try again in 60 seconds."
     elif aligned_count >= 4:
         verdict = "GO"
-        summary = f"{aligned_count}/{available_count} signals align — high conviction {action.upper()}."
+        summary = f"{aligned_count}/{available_count} signals align — high conviction {action.upper()}. Proceed."
     elif aligned_count >= 2:
         verdict = "WAIT"
-        summary = f"{aligned_count}/{available_count} signals align — mixed. Wait 15 minutes and re-check."
+        summary = f"{aligned_count}/{available_count} signals align — mixed. Wait 15 min and re-check."
     else:
         verdict = "NO-GO"
         summary = f"{aligned_count}/{available_count} signals align — signals conflict with {action.upper()}. Do not proceed."
 
-    # Confidence
     if available_count >= 4 and (aligned_count >= 4 or aligned_count <= 1):
         confidence = "high"
     elif available_count >= 3:
@@ -320,7 +311,6 @@ def get_ip_hash(req) -> str:
 
 
 def check_payment(req) -> tuple[bool, str]:
-    """Returns (allowed, reason)."""
     if not PAYMENT_ENABLED:
         return True, "payment_disabled"
     ip_hash = get_ip_hash(req)
@@ -346,7 +336,6 @@ def execution_gate():
     ticker = request.args.get("ticker", "").upper().strip()
     action = request.args.get("action", "").lower().strip()
 
-    # Validate
     all_supported = SUPPORTED_CRYPTO + SUPPORTED_STOCKS
     if not ticker:
         return jsonify({"error": "ticker parameter required", "supported": all_supported}), 400
@@ -355,7 +344,6 @@ def execution_gate():
     if action not in SUPPORTED_ACTIONS:
         return jsonify({"error": f"action must be one of: {SUPPORTED_ACTIONS}"}), 400
 
-    # Payment check
     allowed, pay_reason = check_payment(request)
     if not allowed:
         return jsonify({
@@ -365,17 +353,14 @@ def execution_gate():
             "docs": "https://github.com/roblambert9/crypto-sentiment-starter"
         }), 402
 
-    # Track
     ip_hash = get_ip_hash(request)
     call_log[ip_hash] = call_log.get(ip_hash, 0) + 1
     total_calls += 1
     if pay_reason == "paid":
         total_paid_calls += 1
 
-    # Asset type
     asset_type = "crypto" if ticker in SUPPORTED_CRYPTO else "stock"
 
-    # Fetch all 5 signals in parallel
     t_start = time.time()
     signals = []
 
@@ -394,8 +379,6 @@ def execution_gate():
                 pass
 
     elapsed = round(time.time() - t_start, 2)
-
-    # Compute verdict
     verdict_data = compute_verdict(signals, action)
 
     return jsonify({
@@ -413,7 +396,7 @@ def execution_gate():
 
 @app.route("/gate", methods=["GET"])
 def gate_shortcut():
-    """Convenience alias: /gate?ticker=BTC&action=buy"""
+    """Alias: /gate?ticker=BTC&action=buy"""
     return execution_gate()
 
 
@@ -423,14 +406,20 @@ def health():
     return jsonify({
         "status": "healthy",
         "agent": "16 — Execution Gate",
-        "version": "1.0.0",
+        "version": "1.1.0",
         "uptime_seconds": uptime,
         "payment_enabled": PAYMENT_ENABLED,
         "call_cost_usd": CALL_COST_USD,
         "free_calls_per_ip": FREE_CALLS_PER_IP,
         "supported_tickers": SUPPORTED_CRYPTO + SUPPORTED_STOCKS,
         "supported_actions": SUPPORTED_ACTIONS,
-        "signal_sources": ["sentiment", "fear_greed", "macro", "whale", "volatility"],
+        "signal_sources": {
+            "sentiment": SENTIMENT_URL,
+            "fear_greed": FEAR_GREED_URL,
+            "macro": MACRO_URL,
+            "whale": WHALE_URL,
+            "volatility": "coingecko"
+        },
         "timestamp": datetime.now(timezone.utc).isoformat()
     })
 
@@ -455,14 +444,14 @@ def analytics():
 def index():
     return jsonify({
         "name": "Execution Gate API — Agent 16",
-        "description": "Pre-trade guardrail for AI agents. Aggregates 5 signals into GO / NO-GO / WAIT verdict.",
+        "description": "Pre-trade guardrail. Aggregates 5 signals into GO / NO-GO / WAIT verdict.",
         "endpoints": {
-            "GET /v1/gate?ticker=BTC&action=buy": "Main gate check — returns verdict",
+            "GET /v1/gate?ticker=BTC&action=buy": "Main gate — returns verdict",
             "GET /gate?ticker=BTC&action=buy": "Alias for /v1/gate",
-            "GET /health": "Service health + config",
+            "GET /health": "Service health + live signal URLs",
             "GET /analytics": "Call count + revenue"
         },
-        "example": "curl 'https://your-railway-url.up.railway.app/v1/gate?ticker=BTC&action=buy'",
+        "example": "curl 'https://web-production-7829.up.railway.app/v1/gate?ticker=BTC&action=buy'",
         "price": f"${CALL_COST_USD}/call (USDC on Base via x402)",
         "free_tier": f"{FREE_CALLS_PER_IP} calls/IP",
         "docs": "https://github.com/roblambert9/crypto-sentiment-starter"
